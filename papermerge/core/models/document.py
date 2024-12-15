@@ -1,33 +1,27 @@
+import io
 import logging
 import os
 from os.path import getsize
+from pathlib import Path
+
+from django.db import models, transaction
 from pikepdf import Pdf
 
-from django.db import models
-from django.db import transaction
-from django.utils.translation import gettext_lazy as _
-
-from polymorphic_tree.managers import (
-    PolymorphicMPTTModelManager,
-    PolymorphicMPTTQuerySet
-)
-
+from papermerge.core import constants as const
+from papermerge.core.features.document_types.models import DocumentType
 from papermerge.core.lib.path import DocumentPath, PagePath
-
-from papermerge.core.storage import get_storage_instance, abs_path
-from .kvstore import KVCompNode, KVNode
-
-from .node import BaseTreeNode
-from .access import Access
-from .utils import (
-    OCR_STATUS_SUCCEEDED,
-    OCR_STATUS_UNKNOWN,
-    OCR_STATUS_CHOICES
+from papermerge.core.models import utils
+from papermerge.core.pathlib import (
+    abs_thumbnail_path,
+    rel2abs,
+    thumbnail_path,
 )
-from .page import Page
-from .document_version import DocumentVersion
-from .finder import default_parts_finder
+from papermerge.core.storage import abs_path
+from papermerge.core.utils import image as image_utils
 
+from .document_version import DocumentVersion
+from .node import BaseTreeNode
+from papermerge.core.constants import ContentType
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +30,7 @@ class UploadStrategy:
     """
     Defines how to proceed with uploaded file
     """
+
     # INCREMENT - Uploaded file is inserted into the newly created
     #   document version
     INCREMENT = 1
@@ -44,27 +39,69 @@ class UploadStrategy:
     MERGE = 2
 
 
-class DocumentManager(PolymorphicMPTTModelManager):
+class FileType:
+    PDF = "pdf"
+    JPEG = "jpeg"
+    PNG = "png"
+    TIFF = "tiff"
 
+
+def get_pdf_page_count(content: io.BytesIO | bytes) -> int:
+    if isinstance(content, bytes):
+        pdf = Pdf.open(io.BytesIO(content))
+    else:
+        pdf = Pdf.open(content)
+    page_count = len(pdf.pages)
+    pdf.close()
+
+    return page_count
+
+
+def create_next_version(doc, file_name, file_size, short_description=None):
+    document_version = doc.versions.filter(size=0).last()
+
+    if not document_version:
+        document_version = DocumentVersion(
+            document=doc, number=doc.versions.count() + 1, lang=doc.lang
+        )
+
+    document_version.file_name = file_name
+    document_version.size = file_size
+    document_version.page_count = 0
+    if short_description:
+        document_version.short_description = short_description
+
+    document_version.save()
+
+    return document_version
+
+
+def file_type(content_type: ContentType) -> FileType:
+    parts = content_type.split("/")
+    if len(parts) == 2:
+        return parts[1]
+
+    raise ValueError(f"Invalid content type {content_type}")
+
+
+class DocumentManager(models.Manager):
     @transaction.atomic
     def create_document(
         self,
-        user_id,
         title,
         lang,
         size=0,
         page_count=0,
         file_name=None,
         parent=None,
-        **kwargs
+        id=None,
+        **kwargs,
     ):
-        doc = Document(
-            title=title,
-            lang=lang,
-            user_id=user_id,
-            parent=parent,
-            **kwargs
-        )
+        attrs = dict(title=title, lang=lang, parent=parent, **kwargs)
+        if id is not None:
+            attrs["id"] = id
+
+        doc = Document(**attrs)
         doc.save()
 
         document_version = DocumentVersion(
@@ -73,13 +110,10 @@ class DocumentManager(PolymorphicMPTTModelManager):
             file_name=file_name,
             size=0,
             page_count=0,
-            short_description=_("Original")
+            lang=lang,
+            short_description="Original",
         )
         document_version.save()
-        # Important! - first document must inherit metakeys from
-        # parent folder
-        # if parent:
-        #    doc.inherit_kv_from(parent)
         return doc
 
     def _get_parent(self, parent_id):
@@ -88,7 +122,7 @@ class DocumentManager(PolymorphicMPTTModelManager):
         """
         parent = None
 
-        if parent_id is None or parent_id == '':
+        if parent_id is None or parent_id == "":
             parent = None
         else:
             try:
@@ -99,196 +133,39 @@ class DocumentManager(PolymorphicMPTTModelManager):
         return parent
 
 
-class DocumentQuerySet(PolymorphicMPTTQuerySet):
-    pass
+class DocumentQuerySet(models.QuerySet):
+    def get_by_breadcrumb(self, breadcrumb: str, user):
+        return utils.get_by_breadcrumb(Document, breadcrumb, user)
 
 
 CustomDocumentManager = DocumentManager.from_queryset(DocumentQuerySet)
 
 
 class Document(BaseTreeNode):
-
     # Will this document be OCRed?
     # If True this document will be OCRed
     # If False, OCR operation will be skipped for this document
     ocr = models.BooleanField(default=True)
-
-    # This field is updated by
-    # `papermerge.avenues.consumers.document.DocumentConsumer`.
-    #
-    # Can be one of: 'unknown', 'received', 'started',
-    # 'failed', 'succeeded' - these values correspond to
-    # celery's task statuses
     ocr_status = models.CharField(
-        choices=OCR_STATUS_CHOICES,
-        default=OCR_STATUS_UNKNOWN,
-        max_length=32
+        choices=utils.OCR_STATUS_CHOICES,
+        default=utils.OCR_STATUS_UNKNOWN,
+        max_length=32,
+    )
+
+    document_type = models.ForeignKey(
+        DocumentType,
+        related_name="documents",
+        on_delete=models.CASCADE,
+        blank=True,
+        null=True,
+        default=None,
     )
 
     objects = CustomDocumentManager()
 
-    @property
-    def idified_title(self):
-        """
-        Returns a title with ID part inserted before extention
-
-        Example:
-            input: title="invoice.pdf", id="233453"
-            output: invoice-233453.pdf
-        """
-        base_title_arr = self.title.split('.')[:-1]
-        base_title = '.'.join(base_title_arr)
-        ext = self.title.split('.')[-1]
-
-        return f'{base_title}-{self.id}.{ext}'
-
-    def each_part(self, abstract_klasses):
-        """
-        Iterates through each INSTANCE of document parts which inherits
-        from given ``abstract_klasses``
-        """
-        model_klasses = []
-
-        for klass in abstract_klasses:
-            model_klasses.extend(default_parts_finder.find(klass))
-
-        for model_klass in model_klasses:
-            # if name is an attribute of a klass which inherits
-            # from AbstractDocument or AbstractNode...
-            try:
-                item = model_klass.objects.get(base_ptr=self)
-                yield item
-            except model_klass.DoesNotExist:
-                # Engineering assumption:
-                # There must be either 0 (zero) or 1 (one)
-                # instances of model_klass with base_ptr pointing
-                # to this document.
-                pass
-
-    def assign_kv_values(self, kv_dict):
-        """
-        Assignes kv_dict of key value to its metadata
-        and metadata of its pages.
-        """
-        logger.debug(
-            f"assign_key_values kv_dict={kv_dict} doc_id={self.id}"
-        )
-        for key, value in kv_dict.items():
-            # for self
-            logger.debug(
-                f"Assign to DOC key={key} value={value}"
-            )
-            self.kv[key] = value
-            # and for all pages of the document
-            for page in self.pages.all():
-                logger.debug(
-                    f"Assign to page number={page.number}"
-                    f" key={key} value={value}"
-                )
-                try:
-                    # Never (automatically) overwrite am
-                    # existing Metadata value
-                    if not page.kv[key]:
-                        # page metadata value is empty fill it in.
-                        page.kv[key] = value
-                except Exception as e:
-                    logging.error(
-                        f"Error: page {page.number}, doc_id={self.id} has no key={key}",  # noqa
-                        exc_info=e
-                    )
-
-    @property
-    def kv(self):
-        return KVNode(instance=self)
-
-    def propagate_changes(
-        self,
-        diffs_set,
-        apply_to_self,
-        attr_updates=[]
-    ):
-        super().propagate_changes(
-            diffs_set=diffs_set,
-            apply_to_self=apply_to_self,
-            attr_updates=attr_updates
-        )
-        # Access permissions are not applicable
-        # for Page models, so if diffs_set contains
-        # instances of Access - just return
-        if (len(diffs_set)):
-            first_diff = diffs_set[0]
-            if len(first_diff):
-                model = list(first_diff)[0]
-                if isinstance(model, Access):
-                    return
-
-        # documents need to propage changes
-        # to their pages
-
-        for page in self.pages.all():
-            page.propagate_changes(
-                diffs_set=diffs_set,
-                apply_to_self=apply_to_self,
-                attr_updates=attr_updates
-            )
-
-    @property
-    def kvcomp(self):
-        return KVCompNode(instance=self)
-
-    def inherit_kv_from(self, node):
-        inherited_kv = [
-            {
-                'key': item.key,
-                'kv_type': item.kv_type,
-                'kv_format': item.kv_format,
-                'value': item.value,
-                'kv_inherited': True
-            } for item in node.kv.all()
-        ]
-        self.kv.update(inherited_kv)
-
     class Meta:
-        verbose_name = _("Document")
-        verbose_name_plural = _("Documents")
-
-    def upload(
-            self,
-            payload,
-            file_path,
-            file_name,
-            strategy=UploadStrategy.INCREMENT
-    ):
-        """
-        Associates payload with specific document version.
-
-        If document has zero sized documend version, it will associte
-        payload with that (existing) version, otherwise it will create
-        new document version and associate it the payload.
-        """
-        pdf = Pdf.open(payload)
-
-        document_version = self.versions.filter(size=0).last()
-
-        if not document_version:
-            document_version = DocumentVersion(
-                document=self,
-                number=self.versions.count(),
-                lang=self.lang
-            )
-
-        document_version.file_name = file_name
-        document_version.size = getsize(file_path)
-        document_version.page_count = len(pdf.pages)
-
-        get_storage_instance().copy_doc(
-            src=file_path,
-            dst=document_version.document_path
-        )
-
-        document_version.save()
-        document_version.create_pages()
-        pdf.close()
+        verbose_name = "Document"
+        verbose_name_plural = "Documents"
 
     def version_bump_from_pages(self, pages):
         """
@@ -306,18 +183,14 @@ class Document(BaseTreeNode):
         else:  # pages queryset
             first_page = pages.first()
             page_count = pages.count()
-        source_pdf = Pdf.open(
-            abs_path(first_page.document_version.document_path.url)
-        )
+        source_pdf = Pdf.open(first_page.document_version.file_path)
         dst_pdf = Pdf.new()
 
         document_version = self.versions.filter(size=0).last()
 
         if not document_version:
             document_version = DocumentVersion(
-                document=self,
-                number=self.versions.count(),
-                lang=self.lang
+                document=self, number=self.versions.count(), lang=self.lang
             )
 
         for page in pages:
@@ -328,16 +201,12 @@ class Document(BaseTreeNode):
         document_version.page_count = page_count
         document_version.save()
 
-        dirname = os.path.dirname(
-            abs_path(document_version.document_path.url)
-        )
+        dirname = os.path.dirname(document_version.file_path)
         os.makedirs(dirname, exist_ok=True)
 
-        dst_pdf.save(abs_path(document_version.document_path.url))
+        dst_pdf.save(document_version.file_path)
 
-        document_version.size = getsize(
-            abs_path(document_version.document_path.url)
-        )
+        document_version.size = getsize(document_version.file_path)
         document_version.save()
 
         document_version.create_pages()
@@ -346,49 +215,24 @@ class Document(BaseTreeNode):
 
         return document_version
 
-    def version_bump(self, page_count=None):
-        """
-        Increment document's version.
-
-        Creates new document version (old version = old version + 1) and
-        copies all attributes from current document version.
-        If ``page_count`` is not None new document version will
-        have ``page_count`` pages (useful when page was deleted or number of
-        new pages were merged into the document).
-        If ``page_count`` is None new version will have same number of pages as
-        previous document (useful when new document was OCRed or
-        when pages were rotated)
-        """
-        last_doc_version = self.versions.last()
-        new_page_count = last_doc_version.page_count
-        if page_count:
-            new_page_count = page_count
-
-        new_doc_version = DocumentVersion(
-            document=self,
-            number=last_doc_version.number + 1,
-            file_name=last_doc_version.file_name,
-            size=0,  # TODO: set to newly created file size
-            page_count=new_page_count,
-            lang=last_doc_version.lang
-        )
-        new_doc_version.save()
-
-        for page_number in range(1, new_page_count + 1):
-            Page.objects.create(
-                document_version=new_doc_version,
-                number=page_number,
-                page_count=new_page_count,
-                lang=last_doc_version.lang
-            )
-
-        return new_doc_version
-
     def __repr__(self):
         return f"Document(id={self.pk}, title={self.title})"
 
     def __str__(self):
         return self.title
+
+    @property
+    def files_iter(self):
+        """Yields folders where associated files with this instance are"""
+        for doc_ver in self.versions.all():
+            for page in doc_ver.pages.all():
+                # folder path to ocr related files
+                yield page.svg_path.parent
+                # folder path to preview files
+                yield abs_thumbnail_path(page.id).parent
+
+            # folder path to file associated with this doc ver
+            yield doc_ver.file_path.parent
 
     @property
     def file_ext(self):
@@ -397,17 +241,13 @@ class Document(BaseTreeNode):
 
     @property
     def absfilepath(self):
-        return abs_path(
-            self.path().url()
-        )
+        return abs_path(self.path().url())
 
     def path(self, version=None):
-
         if version is None:
             version = self.version
 
         version = int(version)
-
         result = DocumentPath(
             user_id=self.user.id,
             document_id=self.id,
@@ -436,7 +276,7 @@ class Document(BaseTreeNode):
             page_path = PagePath(
                 document_path=self.path(version=version),
                 page_num=page_num,
-                page_count=self.get_pagecount(version=version)
+                page_count=self.get_pagecount(version=version),
             )
             results.append(page_path)
 
@@ -446,35 +286,36 @@ class Document(BaseTreeNode):
         return PagePath(
             document_path=self.path(version=version),
             page_num=page_num,
-            page_count=self.page_count
+            page_count=self.page_count,
         )
 
-    def preview_path(self, page, size=None):
+    def generate_thumbnail(self, size: int = const.DEFAULT_THUMBNAIL_SIZE) -> Path:
+        """Generates thumbnail image for the document
 
-        if page > self.page_count or page < 0:
-            raise ValueError("Page index out of bound")
+        The thumbnail is generated from the first page of the
+        last version of document.
 
-        file_name = os.path.basename(self.file_name)
-        root, _ = os.path.splitext(file_name)
-        page_count = self.pages_num
+        The local path to the generated thumbnail will be
+        /<MEDIA_ROOT>/thumbnails/<splitted document version uuid>/<size>.jpg
 
-        if not size:
-            size = "orig"
+        splitted DOCUMENT VERSION UUID - is UUID of the last document version
+        written as ... /uuid[0:2]/uuid[2:4]/uuid/ ...
 
-        if page_count <= 9:
-            fmt_page = "{root}-page-{num:d}.{ext}"
-        elif page_count > 9 and page_count < 100:
-            fmt_page = "{root}-page-{num:02d}.{ext}"
-        elif page_count > 100:
-            fmt_page = "{root}-page-{num:003d}.{ext}"
+        Returns absolute path to the thumbnail image as
+        instance of ``pathlib.Path``
+        """
+        last_version = self.versions.last()
+        first_page = last_version.pages.first()
+        abs_thumbnail_path = rel2abs(thumbnail_path(first_page.id, size=size))
+        pdf_path = last_version.file_path
 
-        return os.path.join(
-            self.dir_path,
-            str(size),
-            fmt_page.format(
-                root=root, num=int(page), ext="jpg"
-            )
+        image_utils.generate_preview(
+            pdf_path=Path(abs_path(pdf_path)),
+            output_folder=abs_thumbnail_path.parent,
+            size=size,
         )
+
+        return abs_thumbnail_path
 
     @property
     def name(self):
@@ -483,13 +324,10 @@ class Document(BaseTreeNode):
 
     def add_tags(self, tags):
         """
-        tags is an iteratable of papermerge.core.models.Tag instances
+        tags is an iterable of papermerge.core.models.Tag instances
         """
         for tag in tags:
-            self.tags.add(
-                tag,
-                tag_kwargs={'user': self.user}
-            )
+            self.tags.add(tag, tag_kwargs={"user": self.user})
 
     def get_ocr_status(self):
         """
@@ -507,6 +345,6 @@ class Document(BaseTreeNode):
         about OCR status.
         """
         if len(self.text) > 0:
-            return OCR_STATUS_SUCCEEDED
+            return utils.OCR_STATUS_SUCCEEDED
 
-        return OCR_STATUS_UNKNOWN
+        return utils.OCR_STATUS_UNKNOWN

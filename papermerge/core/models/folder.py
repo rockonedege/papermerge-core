@@ -1,44 +1,59 @@
+from typing import List
+
+from celery import current_app
 from django.db import models
-from django.utils.translation import gettext_lazy as _
 
-from polymorphic_tree.managers import (
-    PolymorphicMPTTModelManager,
-    PolymorphicMPTTQuerySet
-)
-
-from papermerge.core.models.diff import Diff
-from papermerge.core.models.kvstore import (
-    KVCompNode,
-    KVNode,
-    KVStoreNode,
-)
-from papermerge.core.models.node import (
-    BaseTreeNode,
-    RELATED_NAME_FMT,
-    RELATED_QUERY_NAME_FMT
-)
+from papermerge.core import constants as const
+from papermerge.core.models import utils
+from papermerge.core.models.node import BaseTreeNode
+from papermerge.core.utils.decorators import if_redis_present
 
 
-class FolderManager(PolymorphicMPTTModelManager):
+class FolderManager(models.Manager):
     pass
 
 
-class FolderQuerySet(PolymorphicMPTTQuerySet):
+class FolderQuerySet(models.QuerySet):
 
     def delete(self, *args, **kwargs):
+        deleted_node_ids = []
         for node in self:
             descendants = node.get_descendants()
 
-            if descendants.count() > 0:
+            if len(descendants) > 0:
+                deleted_node_ids.append(str(node.pk))
                 descendants.delete(*args, **kwargs)
             # At this point all descendants were deleted.
             # Self delete :)
             try:
+                deleted_node_ids.append(str(self.pk))
                 node.delete(*args, **kwargs)
             except BaseTreeNode.DoesNotExist:
                 # this node was deleted by earlier recursive call
                 # it is ok, just skip
                 pass
+
+            self.publish_post_delete_task(deleted_node_ids)
+
+    @if_redis_present
+    def publish_post_delete_task(self, node_ids: List[str]):
+        current_app.send_task(
+            const.INDEX_REMOVE_NODE, kwargs={"item_ids": node_ids}, route_name="i3"
+        )
+
+    def get_by_breadcrumb(
+        self, breadcrumb: str, user  # should this be pathlib.PurePath ?
+    ) -> "Folder":
+        """
+        Returns ``Folder`` instance of the node defined by given
+        breadcrumb path of specific ``User``.
+
+        Example of usage:
+
+        folder = Folder.objects.get_by_breadcrumb('.home/My Documents', user)
+        assert folder.title == 'My Documents'
+        """
+        return utils.get_by_breadcrumb(Folder, breadcrumb, user)
 
 
 CustomFolderManager = FolderManager.from_queryset(FolderQuerySet)
@@ -64,73 +79,31 @@ class Folder(BaseTreeNode):
     class JSONAPIMeta:
         resource_name = "folders"
 
-    def delete(self, *args, **kwargs):
-        descendants = self.basetreenode_ptr.get_descendants()
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+        self.publish_post_save_task()
 
-        if descendants.count() > 0:
-            for node in descendants:
-                try:
-                    node.delete(*args, **kwargs)
-                except BaseTreeNode.DoesNotExist:
-                    pass
-        # At this point all descendants were deleted.
-        # Self delete :)
-        try:
-            super().delete(*args, **kwargs)
-        except BaseTreeNode.DoesNotExist:
-            # this node was deleted by earlier recursive call
-            # it is ok, just skip
-            pass
+    @if_redis_present  # skip this method when running tests
+    def publish_post_save_task(self):
+        """Send task to worker to add folder changes to search index
 
-    @property
-    def kv(self):
-        return KVNode(instance=self)
-
-    @property
-    def kvcomp(self):
-        return KVCompNode(instance=self)
-
-    def inherit_kv_from(self, folder):
-        instances_set = []
-
-        for key in folder.kv.keys():
-            instances_set.append(
-                KVStoreNode(key=key, kv_inherited=True, node=self)
-            )
-
-        # if there is metadata
-        if len(instances_set) > 0:
-            diff = Diff(
-                operation=Diff.ADD,
-                instances_set=instances_set
-            )
-
-            self.propagate_changes(
-                diffs_set=[diff],
-                apply_to_self=True
-            )
+        This method WILL NOT be invoked during tests
+        """
+        id_as_str = str(self.pk)
+        current_app.send_task(
+            const.INDEX_ADD_NODE, kwargs={"node_id": id_as_str}, route_name="i3"
+        )
 
     class Meta:
-        verbose_name = _("Folder")
-        verbose_name_plural = _("Folders")
+        verbose_name = "Folder"
+        verbose_name_plural = "Folders"
 
     def __str__(self):
         return self.title
 
-
-class AbstractFolder(models.Model):
-    base_ptr = models.ForeignKey(
-        Folder,
-        related_name=RELATED_NAME_FMT,
-        related_query_name=RELATED_QUERY_NAME_FMT,
-        on_delete=models.CASCADE
-    )
-
-    class Meta:
-        abstract = True
-
-    def get_title(self):
-        return self.base_ptr.title
+    def get_children(self):
+        """Returns direct children of current node"""
+        return Folder.objects.filter(parent=self)
 
 
 def get_inbox_children(user):
@@ -138,9 +111,6 @@ def get_inbox_children(user):
     Returns a ``QuerySet`` containing the immediate children nodes
     of given user's inbox folder
     """
-    inbox_node = BaseTreeNode.objects.get(
-        title=Folder.INBOX_TITLE,
-        user=user
-    )
+    inbox_node = BaseTreeNode.objects.get(title=Folder.INBOX_TITLE, user=user)
 
     return inbox_node.get_children()
