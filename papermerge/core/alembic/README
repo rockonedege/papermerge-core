@@ -1,0 +1,21 @@
+Generic single-database configuration.
+
+
+Create initial migration:
+
+```
+  $ alembic revision --autogenerate -m "Initial migration"
+```
+
+Run migration:
+
+ ```
+ $ alembic upgrade head
+ ```
+
+
+Create a migration:
+
+```
+$ alembic revision -m "add value_yearmonth column to custom_field_values"
+```
