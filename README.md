@@ -1,108 +1,68 @@
-[![Tests](https://github.com/papermerge/papermerge-core/actions/workflows/ci.yml/badge.svg)](https://github.com/papermerge/papermerge-core/actions/workflows/ci.yml)
-
-# Papermerge RESTful Backend Server
+[![Tests](https://github.com/papermerge/papermerge-core/actions/workflows/tests.yml/badge.svg)](https://github.com/papermerge/papermerge-core/actions/workflows/tests.yml)
 
 
-This python package is the heart of Papermerge project. It consists of a set
-of reusable Django apps which are consumed across different bundles of
-Papermerge Document Management System (DMS).
+<p align="center">
+<img src="./artwork/logo-w160px.png" />
+</p>
+<h1 align="center">Papermerge DMS</h1>
 
-Technically speaking, it contains following Django apps:
+Papermerge DMS or simply Papermerge is a open source document management system
+designed to work with scanned documents (also called digital archives). It
+extracts text from your scans using OCR, indexes
+them, and prepares them for full text search. Papermerge provides the look and feel
+of modern desktop file browsers. It has features like dual panel document
+browser, drag and drop, tags, hierarchical folders and full text search so that
+you can efficiently store and organize your documents.
 
-* ``papermerge.core`` - the epicenter of Papermerge project
-* ``papermerge.notifications`` - Django Channels app for sending notifications via websockets
-* ``papermerge.search`` - Thin RESTful API layer over [elasticsearch](https://github.com/elastic/elasticsearch)
+It supports PDF, TIFF, JPEG and PNG document file formats.
+Papermerge is perfect tool for long term storage of your documents.
 
-This package is intended to be part of Django project [like this one](https://github.com/ciur/papermerge/) for example.
-
-## What is Papermerge?
-
-Papermerge is an open source document management system (DMS) primarily
-designed for archiving and retrieving your digital documents. Instead of
-having piles of paper documents all over your desk, office or drawers - you
-can quickly scan them and configure your scanner to directly upload to
-Papermerge DMS. Papermerge DMS on its turn will extract text data from the
-scanned documents using Optical Character Recognition (OCR) technology the
-index it and make it searchable. You will be able to quickly find any
-(scanned!) document using full text search capabilities.
-
-Papermerge is perfect tool to manage documents in PDF, JPEG, TIFF and PNG formats.
+<p align="center">
+<img src="./artwork/papermerge3-3.png" />
+</p>
 
 ## Features Highlights
 
-* RESTul API
-* Documents of pdf, jpg, png, tiff formats are supported
-* OCR (Optical Character Recognition) of the documents (uses [OCRmyPDF](https://github.com/ocrmypdf/OCRmyPDF))
-* Full Text Search of the scanned documents (uses [elasticsearch](https://github.com/elastic/elasticsearch))
-* Document Versions
-* User defined metadata per folder/document/page
+* Web UI with desktop like experience
+* OpenAPI compliant REST API
+* Works with PDF, JPEG, PNG and TIFF documents
+* OCR (Optical Character Recognition) of the documents
+* OCRed text overlay (you can download document with OCRed text overlay)
+* Full Text Search of the scanned documents
+* Document Versioning
 * Tags - assign colored tags to documents or folders
 * Documents and Folders - users can organize documents in folders
-* Multi-User (Groups, Roles)
-* User permissions management
-* Document permissions management
-* Page Management - delete, reorder, cut & paste pages (uses [PikePDF](https://github.com/pikepdf/pikepdf))
-* Automation
+* Document Types (i.e. Categories)
+* Custom Fields (metadata) per document type
+* Multi-User
+* Page Management - delete, reorder, cut, move, extract pages
 
 ## Documentation
 
-Online documentation is available at [https://docs.papermerge.io](https://docs.papermerge.io/)
+Papermerge DMS documentation is available at [https://docs.papermerge.io](https://docs.papermerge.io/)
+
+## Start with Docker
+
+In order to start Papermerge App with the most basic setup use following command:
+
+    docker run -p 8000:80 \
+        -e PAPERMERGE__SECURITY__SECRET_KEY=abc \
+        -e PAPERMERGE__AUTH__PASSWORD=123 \
+        papermerge/papermerge:3.3.1
+
+For more info about various docker compose scenarios check [documentation page](https://docs.papermerge.io/3.3/setup/docker-compose/).
 
 
-## Tests
+## Demo Page
 
-Use [poetry](https://python-poetry.org/) to switch into python virtual environment:
+Online demo is available at: https://demo.papermerge.com
 
-    poetry shell
+```
+Username: demo
+Password: demo
+```
 
-Then install all dependencies in current python virtual environment:
-
-    poetry install
-
-Test suite is devided into two big groups:
-
-1. tests.core
-2. tests.search
-
-
-First group (tests.core) is concerned with tests for `papermerge.core` while
-second one (tests.search) is concerned with tests for `papermerge.search`. In
-order to run `tests.core` tests you need to have redis up and running; in
-order to run `test.search` you need to both **redis and elasticsearch** up and
-running.
-
-### Core Tests
-
-Before running core tests suite, make sure redis service is up and running. Run tests:
-
-     DJANGO_SETTINGS_MODULE=tests.config.core_settings PYTHONPATH=. pytest tests/core/
-
-Another way to invoke [pytest](https://docs.pytest.org/en/latest/contents.html), which automatically adds
-current working directory to PYTHONPATH:
-
-    DJANGO_SETTINGS_MODULE=tests.config.core_settings python -m pytest tests/core/
-
-Disable warning during test runs:
-
-    DJANGO_SETTINGS_MODULE=tests.config.core_settings python -m pytest --disable-warnings tests/core/
-
-One handy shortcut to invoke pytests in python virtual environment:
-
-    DJANGO_SETTINGS_MODULE=tests.config.core_settings poetry run python -m pytest --disable-warnings tests/core/
-
-You can use ``run-tests.sh`` bash script to run core tests:
-
-    ./run-tests.sh core
-
-
-### Search Tests
-
-Before running search tests suite, make sure both **redis and elasticsearch**
-services are up and running:
-
-     DJANGO_SETTINGS_MODULE=tests.config.search_settings poetry run python -m pytest --disable-warnings tests/search/
-
-You can use ``run-tests.sh`` bash script to run tests for search app:
-
-    ./run-tests.sh search
-
+Please note that, in order to save resources, online demo instance is deployed
+using very basic setup: there is no OCR worker and no full text search engine
+behind. Online instance is reseted every 24 hours (0:00 UTC timezone). Reset
+means that all data is restored to initial state and all documents are deleted.

@@ -1,0 +1,11 @@
+.documentDetailsToggleOpened {
+  button:focus {
+    outline: none;
+  }
+}
+
+.documentDetailsToggleClosed {
+  button:focus {
+    outline: none;
+  }
+}

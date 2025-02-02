@@ -1,82 +1,95 @@
 import logging
+import uuid
+from pathlib import PurePath
 
 from django.utils.translation import gettext_lazy as _
 
-
 logger = logging.getLogger(__name__)
 
-OCR_STATUS_SUCCEEDED = 'succeeded'
-OCR_STATUS_RECEIVED = 'received'
-OCR_STATUS_STARTED = 'started'
-OCR_STATUS_FAILED = 'failed'
-OCR_STATUS_UNKNOWN = 'unknown'
+OCR_STATUS_SUCCEEDED = "SUCCESS"
+OCR_STATUS_RECEIVED = "RECEIVED"
+OCR_STATUS_STARTED = "STARTED"
+OCR_STATUS_FAILED = "FAILED"
+OCR_STATUS_UNKNOWN = "UNKNOWN"
 
 OCR_STATUS_CHOICES = [
-    ('unknown', _('Unknown')),
-    ('received', _('Received')),
-    ('started', _('Started')),
-    ('succeeded', _('Succeeded')),
-    ('failed', _('Failed')),
+    ("unknown", _("Unknown")),
+    ("received", _("Received")),
+    ("started", _("Started")),
+    ("succeeded", _("Succeeded")),
+    ("failed", _("Failed")),
 ]
 
 
-def get_fields(model):
+def uuid2raw_str(value: uuid.UUID) -> str:
+    """Converts value into string as stored in database
+
+    In database, UUID is stored as varchar(32) without '-' character.
+    For example: UUID('1a606e93-b39c-439a-b8dd-8e981cb4d54b')
+    will be converted to '1a606e93b39c439ab8dd8e981cb4d54b'.
     """
-    Returns django fields of current ``model``.
+    if value is None:
+        raise ValueError("Non-empty value expected")
 
-    Does not include inherited fields.
+    if value == "":
+        raise ValueError("Non-empty value expected")
+
+    return str(value).replace("-", "")
+
+
+def get_by_breadcrumb(klass, breadcrumb: str, user):
     """
-    return model._meta.get_fields(include_parents=False)
+    Returns node instance identified by breadcrumb
 
+    This method uses SQL which is not portable: '||' is concatenates
+    strings ONLY in SQLite and PostgreSQL.
 
-def group_per_model(models, **kwargs):
+    user is instance of the `papermerge.core.models.User`
+    class can be either Folder or Document.
+
+    Returns instance of either Folder or Document.
     """
-    groups kwargs per model
+    from papermerge.core.models import BaseTreeNode
 
-    What this method is supposed to do is better exmplained by example.
-    Suppose there are 3 models i.e. ``models`` list contains
-    3 models: [Model_1, Model_2, Model_3]. Each of these models
-    has following django field attributes:
+    if klass.__name__ not in ("Folder", "Document"):
+        raise ValueError("klass should be either Folder or Document")
 
-        class Model_1:
-            attr_m1_a
-            attr_m1_b
-
-        class Model_2:
-            attr_m2_x
-
-        class Model_3:
-            attr_m3_j
-            attr_m3_k
-
-    kwargs_ex_1 = {
-        'blah': 1, 'extra': 2, 'attr_m1_a': "see?", 'attr_m1_b': "this?"
-    }
-
-    group_per_model(models, **kwargs_ex_1) will return:
-
-        {
-            Model_1: {'attr_m1_a': "see?", 'attr_m1_b': "this?"}
-        }
-
-    kwargs_ex_2 = {
-        'blah': 1, attr_m1_a': "AB", 'attr_m2_x': "XX"
-    }
-    group_per_model(models, **kwargs_ex_2) will return:
-
-        {
-            Model_1: {'attr_m1_a': "AB"}
-            Model_2: {'attr_m2_x': "XX"}
-        }
+    first_part = PurePath(breadcrumb).parts[0]
+    pure_breadcrumb = str(PurePath(breadcrumb))  # strips '/' at the end
+    sql = """
+     WITH RECURSIVE tree AS (
+         SELECT id,
+            user_id,
+            title,
+            CAST(title AS character varying) as breadcrumb
+         FROM nodes WHERE title = %s
+         UNION ALL
+         SELECT nodes.id,
+            nodes.user_id,
+            nodes.title,
+            (breadcrumb || '/'  || nodes.title) as breadcrumb
+         FROM nodes, tree
+         WHERE nodes.parent_id = tree.id
+     )
+     """
+    sql += """
+    SELECT id, title FROM tree
+    WHERE breadcrumb = %s and user_id = %s LIMIT 1
     """
-    ret = {}
+    user_id = uuid2raw_str(user.pk)
+    result_list = list(
+        BaseTreeNode.objects.raw(sql, [first_part, pure_breadcrumb, user_id])
+    )
 
-    for model in models:
-        fields = get_fields(model)
-        for field in fields:
-            if field.name in kwargs.keys():
-                ret.setdefault(model, {}).update(
-                    {field.name: kwargs[field.name]}
-                )
+    if len(result_list) == 0:
+        raise klass.DoesNotExist()
 
-    return ret
+    if len(result_list) > 1:
+        raise klass.MultipleObjectsReturned()
+
+    attr_name = klass.__name__.lower()
+    # same as calling either result_list[0].folder or
+    # result_list[0].document
+    result = getattr(result_list[0], attr_name)
+
+    return result

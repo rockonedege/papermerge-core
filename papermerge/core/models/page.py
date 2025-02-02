@@ -1,19 +1,20 @@
+import io
 import logging
 import os
 import uuid
+from pathlib import Path
 
 from django.db import models
-from pikepdf import Pdf, PdfImage
 
-from papermerge.core.lib.path import PagePath
+from papermerge.core import constants as const
+from papermerge.core.pathlib import (abs_page_hocr_path, abs_page_jpg_path,
+                                     abs_page_svg_path, abs_page_txt_path,
+                                     abs_thumbnail_path)
 from papermerge.core.storage import abs_path
+from papermerge.core.utils import clock
+from papermerge.core.utils import image as image_utils
 
-from .diff import Diff
-from .kvstore import KVCompPage, KVPage, KVStorePage
-from .utils import (
-    OCR_STATUS_SUCCEEDED,
-    OCR_STATUS_UNKNOWN
-)
+from .utils import OCR_STATUS_SUCCEEDED, OCR_STATUS_UNKNOWN
 
 logger = logging.getLogger(__name__)
 
@@ -77,103 +78,6 @@ class Page(models.Model):
         return f"id={self.pk} number={self.number}"
 
     @property
-    def kv(self):
-        return KVPage(instance=self)
-
-    @property
-    def kvcomp(self):
-        return KVCompPage(instance=self)
-
-    def _apply_diff_add(self, diff):
-
-        self.kv.apply_additions(
-            [
-                {
-                    'kv_inherited': True,
-                    'key': _model.key,
-                    'kv_format': _model.kv_format,
-                    'kv_type': _model.kv_type
-                }
-                for _model in diff
-            ]
-        )
-
-    def _apply_diff_update(self, diff, attr_updates):
-        updates = [{
-            'kv_inherited': True,
-            'key': _model.key,
-            'kv_format': _model.kv_format,
-            'kv_type': _model.kv_type,
-            'id': _model.id
-        } for _model in diff]
-
-        updates.extend(attr_updates)
-
-        self.kv.apply_updates(updates)
-
-    def _apply_diff_delete(self, diff):
-        pass
-
-    def apply_diff(self, diffs_list, attr_updates):
-
-        for diff in diffs_list:
-            if diff.is_add():
-                self._apply_diff_add(diff)
-            elif diff.is_update():
-                self._apply_diff_update(diff, attr_updates)
-            elif diff.is_delete():
-                self._apply_diff_delete(diff)
-            elif diff.is_replace():
-                # not applicable to page model
-                # replace is used in access permissions
-                # propagation
-                pass
-            else:
-                raise ValueError(
-                    f"Unexpected diff {diff} type"
-                )
-
-    def inherit_kv_from(self, document):
-        instances_set = []
-
-        for kvstore in document.kv.all():
-            instances_set.append(
-                KVStorePage(
-                    key=kvstore.key,
-                    kv_format=kvstore.kv_format,
-                    kv_type=kvstore.kv_type,
-                    value=kvstore.value,
-                    kv_inherited=True,
-                    page=self
-                )
-            )
-
-        diff = Diff(
-            operation=Diff.ADD,
-            instances_set=instances_set
-        )
-
-        self.propagate_changes(
-            diffs_set=[diff],
-        )
-
-    def propagate_changes(
-        self,
-        diffs_set,
-        apply_to_self=None,
-        attr_updates=[]
-    ):
-        """
-        apply_to_self argument does not make sense here.
-        apply_to_self argument is here to make this function
-        similar to node.propagate_changes.
-        """
-        self.apply_diff(
-            diffs_list=diffs_set,
-            attr_updates=attr_updates
-        )
-
-    @property
     def is_archived(self):
         """
         Returns True of page is archived.
@@ -192,13 +96,30 @@ class Page(models.Model):
     def is_first(self):
         return self.number == 1
 
-    @property
-    def page_path(self):
+    def generate_thumbnail(
+        self,
+        size: int = const.DEFAULT_THUMBNAIL_SIZE
+    ) -> Path:
+        """Generates page thumbnail/preview image for the document
 
-        return PagePath(
-            document_path=self.document_version.document_path,
-            page_num=self.number,
+        The local path to the generated thumbnail will be
+        /<MEDIA_ROOT>/pages/jpg/<splitted page uuid>/<size>.jpg
+
+        Returns absolute path to the thumbnail image as
+        instance of ``pathlib.Path``
+        """
+        thb_path = abs_thumbnail_path(str(self.id), size=size)
+
+        pdf_path = self.document_version.file_path  # noqa
+
+        image_utils.generate_preview(
+            pdf_path=Path(pdf_path),
+            page_number=int(self.number),
+            output_folder=thb_path.parent,
+            size=size
         )
+
+        return thb_path
 
     @property
     def has_text(self):
@@ -208,38 +129,35 @@ class Page(models.Model):
     def stripped_text(self):
         return self.text.strip()
 
-    def update_text_field(self, stream):
+    def update_text_field(self, stream: io.StringIO):
         """Update text field from given IO stream.
 
         Returns text read from IO stream
         """
-        logger.debug(
-            'update_text_field:'
-            f'len(page.stripped_text)=={len(self.stripped_text)}'
-        )
         self.text = stream.read()
         self.save()
 
         return self.stripped_text
 
     @property
-    def txt_url(self):
-        result = PagePath(
-            document_path=self.document_version.document_path,
-            page_num=self.number
-        )
+    def txt_path(self) -> Path:
+        return abs_page_txt_path(str(self.id))
 
-        return result.txt_url
+    @property
+    def svg_path(self) -> Path:
+        return abs_page_svg_path(str(self.id))
+
+    @property
+    def jpg_path(self) -> Path:
+        return abs_page_jpg_path(str(self.id))
+
+    @property
+    def hocr_path(self) -> Path:
+        return abs_page_hocr_path(str(self.id))
 
     @property
     def txt_exists(self):
-
-        result = PagePath(
-            document_path=self.document.document_path,
-            page_num=self.number
-        )
-
-        return result.txt_exists()
+        return self.txt_path.exists()
 
     def norm(self):
         """shortcut normalization method"""
@@ -293,41 +211,18 @@ class Page(models.Model):
 
         return OCR_STATUS_UNKNOWN
 
-    def generate_img(self):
-        doc_file_path = self.document_version.document_path
-        # extract page number preview from the document file
-        # if this is PDF - use pike pdf to extract that preview
-        pdffile = Pdf.open(abs_path(doc_file_path.url))
-        page = pdffile.pages[self.number - 1]
-        image_keys = list(page.images.keys())
-        raw_image = page.images[image_keys[0]]
-        pdfimage = PdfImage(raw_image)
-        abs_file_prefix = abs_path(self.page_path.ppmroot)
-        abs_dirname_prefix = os.path.dirname(abs_file_prefix)
-        os.makedirs(
-            abs_dirname_prefix,
-            exist_ok=True
-        )
-        pil_image = pdfimage.as_pil_image()
-        page_rotation = 0
-        if '/Rotate' in page:
-            page_rotation = page['/Rotate']
-        if page_rotation > 0:
-            # The image is not rotated in place. You need to store the image
-            # returned from rotate()
-            new_pil_image = pil_image.rotate(page_rotation)
-            new_pil_image.save(f"{abs_file_prefix}.jpg")
-            return
-        # Will create jpg image without '_ocr' suffix
-        return pdfimage.extract_to(fileprefix=abs_file_prefix)
-
+    @clock
     def get_jpeg(self):
-        jpeg_abs_path = abs_path(self.page_path.jpg_url)
-        if not os.path.exists(jpeg_abs_path):
-            self.generate_img()
+        jpeg_abs_path = abs_path(self.page_path.preview_url)
 
         if not os.path.exists(jpeg_abs_path):
-            # means that self.generate_img() failed
+            # generate preview only for this page
+            self.document_version.generate_previews(
+                page_number=self.number
+            )
+
+        if not os.path.exists(jpeg_abs_path):
+            # means that self.generate_preview() failed
             # to extract page image from the document
             raise IOError
 
@@ -336,6 +231,7 @@ class Page(models.Model):
 
         return data
 
+    @clock
     def get_svg(self):
         svg_abs_path = abs_path(
             self.page_path.svg_url
@@ -344,7 +240,7 @@ class Page(models.Model):
         if not os.path.exists(svg_abs_path):
             raise IOError
 
-        with open(svg_abs_path, "r") as f:
+        with open(svg_abs_path, "rb") as f:
             data = f.read()
 
         return data

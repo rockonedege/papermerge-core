@@ -1,99 +1,176 @@
-import pytz
 import uuid
+from typing import List, Tuple
 
-from django.utils import timezone
+from celery import current_app
 from django.db import models
-from django.utils.translation import gettext_lazy as _
-from django.contrib.contenttypes.models import ContentType
-
-from taggit.managers import TaggableManager
+from django.db.models import Q
+from taggit.managers import TaggableManager, _TaggableManager
 
 from papermerge.core import validators
-from papermerge.core.models.access import Access
-from papermerge.core.models.diff import Diff
+from papermerge.core.constants import INDEX_ADD_NODE, INDEX_REMOVE_NODE
 from papermerge.core.models.tags import ColoredTag
-from papermerge.core.models.kvstore import KVStoreCompNode, KVStoreNode
-from polymorphic_tree.models import (
-    PolymorphicMPTTModel,
-    PolymorphicTreeForeignKey
-)
-from polymorphic_tree.managers import (
-    PolymorphicMPTTModelManager,
-    PolymorphicMPTTQuerySet
-)
+from papermerge.core.signal_definitions import node_post_move
+from papermerge.core.utils.decorators import if_redis_present
 
-# things you can propagate from parent node to
-# child node
-PROPAGATE_ACCESS = 'access'
-PROPAGATE_KV = 'kv'
-PROPAGATE_KVCOMP = 'kvcomp'
-RELATED_NAME_FMT = "%(app_label)s_%(class)s_related"
-RELATED_QUERY_NAME_FMT = "%(app_label)s_%(class)ss"
+from .utils import uuid2raw_str
+
+NODE_TYPE_FOLDER = "folder"
+NODE_TYPE_DOCUMENT = "document"
 
 
-class NodeManager(PolymorphicMPTTModelManager):
+def move_node(source_node, target_node):
+    """
+    Set `target_node` as new parent of `source_node`.
+
+    Also send `papermerge.core.signal_definitions.node_post_move` signal
+    to all interested parties. Search indexes will be interested in this
+    signal as they will have to update breadcrumb of all descendants of the
+    new parent.
+    """
+    source_node.parent = target_node
+    source_node.save()
+    node_post_move.send(
+        sender=BaseTreeNode, instance=source_node, new_parent=target_node
+    )
+
+
+class PolymorphicTagManager(_TaggableManager):
+    """
+    What is this ugliness all about?
+
+    `taggit` adds tags to models. Besides useful attributes of tag like
+    name and color, tags also consider the "type" of the associated model.
+    For example if we would add tag to Folder model - f1.add(['red', 'blue'])
+    when looking up tags associated to f1 i.e. `f1.tags.all()` `taggit`
+    internals will search for all tags with name 'red' and 'blue' AND
+    model name `Folder` (actually django's ContentType of the model `Folder`).
+    Similar for `Document` model doc.tags.all() - will look up for all tags
+    associated to doc instance AND model `Document`.
+
+    In context of Papermerge, both `Folder` and `Documents` are `BaseTreeNode`s
+    as well - so when user adds tags to `Folder` or `Document` instances he/she
+    expects to find same tags when looking via associated node instances.
+
+    Example A:
+
+        $ f1 = Folder.objects.create(...)
+        $ f1.tags.add(['red', 'blue'])
+        $ node = BaseTreeNode.objects.get(pk=f1.pk)     (1)
+        $ node.tags.all() == f1.tags.all()              (2)
+
+    In (1) we get associated node of the folder f1 - and in (2) we expect
+    that node instance will have tags 'red' and 'blue' associated.
+
+    The problem is that `taggit` does not work that way and without
+    workaround implemented by `PolymorphicTagManager` the scenario described
+    in Example A will not work - because when performing `node.tags.all()`
+    default `taggit` behaviour is to consider `ContentType` of the associated
+    instance - in this case `BaseTreeNode`; because tags were added via Folder
+    - they won't be found when looked up via `BaseTreeNode` (and vice versa).
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # Instead of Document or Folder instances/models
+        # always use associated BaseTreeNode instances/model
+        if hasattr(self.instance, "basetreenode_ptr"):  # Document or Folder
+            self.model = self.instance.basetreenode_ptr.__class__
+            self.instance = self.instance.basetreenode_ptr
+
+
+class NodeManager(models.Manager):
     pass
 
 
-class NodeQuerySet(PolymorphicMPTTQuerySet):
+class NodeQuerySet(models.QuerySet):
 
     def delete(self, *args, **kwargs):
+        deleted_item_ids = []
         for node in self:
             descendants = node.get_descendants()
-
-            if descendants.count() > 0:
-                descendants.delete(*args, **kwargs)
+            if len(descendants) > 0:
+                for item in descendants:
+                    if item.is_folder:
+                        deleted_item_ids.append(str(item.pk))
+                    else:
+                        last_ver = item.document.versions.last()
+                        for page in last_ver.pages.all():
+                            deleted_item_ids.append(str(page.pk))
+                    item.delete(*args, **kwargs)
             # At this point all descendants were deleted.
             # Self delete :)
             try:
+                if node.is_folder:
+                    deleted_item_ids.append(str(node.pk))
+                else:
+                    last_ver = node.document.versions.last()
+                    for page in last_ver.pages.all():
+                        deleted_item_ids.append(str(page.pk))
                 node.delete(*args, **kwargs)
             except BaseTreeNode.DoesNotExist:
                 # this node was deleted by earlier recursive call
                 # it is ok, just skip
                 pass
 
+        self.publish_post_delete_task(deleted_item_ids)
+
+    @if_redis_present
+    def publish_post_delete_task(self, node_ids: List[str]):
+        current_app.send_task(
+            INDEX_REMOVE_NODE, kwargs={"item_ids": node_ids}, route_name="i3"
+        )
+
 
 CustomNodeManager = NodeManager.from_queryset(NodeQuerySet)
 
 
-class BaseTreeNode(PolymorphicMPTTModel):
+class BaseTreeNode(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4)
 
-    parent = PolymorphicTreeForeignKey(
-        'self',
-        models.CASCADE,
+    parent = models.ForeignKey(
+        "self",
+        on_delete=models.CASCADE,
         blank=True,
         null=True,
-        related_name='children',
-        verbose_name=_('parent')
+        related_name="children",
+        verbose_name="parent",
     )
+    # shortcut - helps to figure out if node is either folder or document
+    # without performing extra joins. This field may be empty. In such
+    # case you need to perform joins with Folder/Document table to figure
+    # out what type of node is this instance.
+    ctype = models.CharField(
+        max_length=16,
+        choices=(
+            (NODE_TYPE_FOLDER, NODE_TYPE_FOLDER),
+            (NODE_TYPE_DOCUMENT, NODE_TYPE_DOCUMENT),
+        ),
+        blank=True,
+        null=True,
+    )
+
     title = models.CharField(
-        _("Title"),
-        max_length=200,
-        validators=[validators.safe_character_validator]
+        "Title", max_length=200, validators=[validators.safe_character_validator]
     )
 
     lang = models.CharField(
-        _('Language'),
-        max_length=8,
-        blank=False,
-        null=False,
-        default='deu'
+        "Language", max_length=8, blank=False, null=False, default="deu"
     )
 
-    user = models.ForeignKey('User', models.CASCADE)
+    user = models.ForeignKey("User", related_name="nodes", on_delete=models.CASCADE)
 
-    created_at = models.DateTimeField(
-        auto_now_add=True
-    )
-    updated_at = models.DateTimeField(
-        auto_now=True
-    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
-    tags = TaggableManager(through=ColoredTag)
+    tags = TaggableManager(through=ColoredTag, manager=PolymorphicTagManager)
 
     # custom Manager + custom QuerySet
     objects = CustomNodeManager()
+
+    @property
+    def breadcrumb(self) -> List[Tuple[uuid.UUID, str]]:
+        return [(item.id, item.title) for item in self.get_ancestors()]
 
     @property
     def idified_title(self):
@@ -105,326 +182,166 @@ class BaseTreeNode(PolymorphicMPTTModel):
             output: "My Invoices-233453"
         """
 
-        return f'{self.title}-{self.id}'
-
-    def human_datetime(self, _datetime) -> str:
-        """
-        Localize and format datetime instance considering user preferences.
-        """
-        tz = pytz.timezone(
-            self.user.preferences['localization__timezone']
-        )
-        fmt = self.user.preferences['localization__date_format']
-        fmt += " " + self.user.preferences['localization__time_format']
-
-        ret_datetime = timezone.localtime(_datetime, timezone=tz)
-
-        ret = ret_datetime.strftime(fmt)
-        return ret
+        return f"{self.title}-{self.id}"
 
     @property
-    def human_updated_at(self) -> str:
-        """
-        updated_at displayed considering user's timezone, date and time prefs.
+    def _type(self) -> str:
+        try:
+            self.folder
+        except Exception:
+            return NODE_TYPE_DOCUMENT
 
-        returns string with user friendly formated datetime.
-        """
-
-        ret = self.human_datetime(self.updated_at)
-        return ret
+        return NODE_TYPE_FOLDER
 
     @property
-    def human_created_at(self) -> str:
-        """
-        created_at displayed considering user's timezone, date and time prefs.
-        """
-        ret = self.human_datetime(self.created_at)
-        return ret
+    def document_or_folder(self):
+        """Returns instance of associated `Folder` or `Document` model"""
+        return self.folder_or_document
 
-    def is_folder(self):
-        folder_ct = ContentType.objects.get(
-            app_label='core', model='folder'
+    @property
+    def folder_or_document(self):
+        """Returns instance of associated `Folder` or `Document` model"""
+        if self.is_folder:
+            return self.folder
+
+        return self.document
+
+    @property
+    def is_folder(self) -> bool:
+        """Returns True if and only if this node is a folder"""
+        if self.ctype in (NODE_TYPE_DOCUMENT, NODE_TYPE_FOLDER):
+            return self.ctype == NODE_TYPE_FOLDER
+
+        return self._type == NODE_TYPE_FOLDER
+
+    @property
+    def is_document(self) -> bool:
+        """Returns True if and only if this node is a document"""
+        if self.ctype in (NODE_TYPE_DOCUMENT, NODE_TYPE_FOLDER):
+            return self.ctype == NODE_TYPE_DOCUMENT
+
+        return self._type == NODE_TYPE_DOCUMENT
+
+    def get_ancestors(self, include_self=True):
+        """Returns all ancestors of the node"""
+        sql = """
+        WITH RECURSIVE tree AS (
+            SELECT *, 0 as level FROM core_basetreenode WHERE id = %s
+            UNION ALL
+            SELECT core_basetreenode.*, level + 1
+            FROM core_basetreenode, tree
+            WHERE core_basetreenode.id = tree.parent_id
         )
-        return self.polymorphic_ctype_id == folder_ct.id
+        """
+        node_id = uuid2raw_str(self.pk)
+        if include_self:
+            sql += "SELECT * FROM tree ORDER BY level DESC"
+            return BaseTreeNode.objects.raw(sql, [node_id])
 
-    def is_document(self):
-        document_ct = ContentType.objects.get(
-            app_label='core', model='document'
+        sql += "SELECT * FROM tree WHERE NOT id = %s ORDER BY level DESC"
+
+        return BaseTreeNode.objects.raw(sql, [node_id, node_id])
+
+    def get_descendants(self, include_self=True):
+        """Returns all descendants of the node"""
+        sql = """
+        WITH RECURSIVE tree AS (
+            SELECT * FROM core_basetreenode WHERE id = %s
+            UNION ALL
+            SELECT core_basetreenode.* FROM core_basetreenode, tree
+              WHERE core_basetreenode.parent_id = tree.id
         )
-        return document_ct.id == self.polymorphic_ctype_id
-
-    def _get_access_diff_updated(self, new_access_list=[]):
         """
-        gathers Diff with updated operation
-        """
-        updates = Diff(op=Diff.UPDATE)
+        node_id = uuid2raw_str(self.pk)
+        if include_self:
+            sql += "SELECT * FROM tree"
+            return BaseTreeNode.objects.raw(sql, [node_id])
 
-        for current in self.access_set.all():
-            for new_access in new_access_list:
-                if new_access == current and current.perm_diff(new_access):
-                    updates.add(new_access)
+        sql += "SELECT * FROM tree WHERE NOT id = %s"
+        return BaseTreeNode.objects.raw(sql, [node_id, node_id])
 
-        return updates
+    def save(self, *args, **kwargs):
+        if not self.ctype:
+            self.ctype = self.__class__.__name__.lower()
 
-    def _get_access_diff_deleted(self, new_access_list=[]):
-        """
-        gathers Diff with deleted operation
-        """
-        dels = Diff(op=Diff.DELETE)
+        super().save(*args, **kwargs)
+        self.publish_post_save_task()
 
-        # if current access is not in the new list
-        # it means current access was deleted.
-        for current in self.access_set.all():
-            if current not in new_access_list:
-                dels.add(current)
-
-        return dels
-
-    def _get_access_diff_added(self, new_access_list=[]):
-        """
-        gathers Diff with added operation
-        """
-        adds = Diff(op=Diff.ADDED)
-
-        # if current access is not in the new list
-        # it means current access was deleted.
-        all_current = self.access_set.all()
-
-        # if new access is not in current access list of the
-        # node - it means it will be added.
-        for new_access in new_access_list:
-            if new_access not in all_current:
-                adds.add(new_access)
-
-        return adds
-
-    def get_access_diffs(self, new_access_list=[]):
-        """
-        * access_list is a list of Access model instances.
-
-        Returns a list of instances of AccessDiff
-        between current node access list and given access list.
-
-        Returned value will be empty list if access_list is same
-        as node's current access.
-        Returned value will be a list with one entry if one or
-        several access were added.
-        Returned value will be a list with one entry if one or
-        several access were removed.
-        Returned value will be a list with two entries if one or
-        several access were added and one or several entries were
-        removed.
-        """
-        ret = []
-        ret.append(
-            self._get_access_diff_updated(new_access_list)
-        )
-        ret.append(
-            self._get_access_diff_added(new_access_list)
-        )
-        ret.append(
-            self._get_access_diff_deleted(new_access_list)
+    @if_redis_present
+    def publish_post_save_task(self):
+        id_as_str = str(self.pk)
+        current_app.send_task(
+            INDEX_ADD_NODE, kwargs={"node_id": id_as_str}, route_name="i3"
         )
 
-        return ret
+    def delete(self, *args, **kwargs):
+        deleted_item_ids = []
+        descendants = self.get_descendants(include_self=False)
 
-    def _apply_diff_add(self, diff):
-        model = diff.first()
-        if isinstance(model, Access):
-            for _model in diff:
-                Access.create(
-                    node=self,
-                    access_inherited=True,
-                    access=_model
-                )
-        elif isinstance(model, KVStoreNode):
+        if len(descendants) > 0:
+            for item in descendants:
+                try:
+                    if item.is_folder:
+                        deleted_item_ids.append(str(item.pk))
+                    else:
+                        last_ver = item.document.versions.last()
+                        for page in last_ver.pages.all():
+                            deleted_item_ids.append(str(page.pk))
 
-            array_to_apply = []
-
-            for _model in diff:
-                array_to_apply.append(
-                    {
-                        'kv_inherited': True,
-                        'key': _model.key,
-                        'kv_type': _model.kv_type,
-                        'kv_format': _model.kv_format
-                    }
-                )
-
-            self.kv.apply_additions(array_to_apply)
-
-        elif isinstance(model, KVStoreCompNode):
-            pass
-        else:
-            raise ValueError(
-                f"Don't know how to replace {model} (found in {diff})"
-            )
-
-    def _apply_diff_delete(self, diff):
-        ids_to_delete = []
-        model = diff.first()
-
-        if isinstance(model, Access):
-            for existing_model in self.access_set.all():
-                for new_model in diff:
-                    if existing_model == new_model:
-                        ids_to_delete.append(
-                            existing_model.id
-                        )
-            Access.objects.filter(id__in=ids_to_delete).delete()
-        elif isinstance(model, KVStoreNode):
-            self.kv.apply_deletions(
-                [
-                    {'kv_inherited': True, 'key': _model.key}
-                    for _model in diff
-                ]
-            )
-        elif isinstance(model, KVStoreCompNode):
-            pass
-        else:
-            raise ValueError(
-                f"Don't know how to replace {model} (found in {diff})"
-            )
-
-    def _apply_diff_update(self, diff, attr_updates):
-        model = diff.first()
-        if isinstance(model, Access):
-            for existing_model in self.access_set.all():
-                for new_model in diff:
-                    existing_model.update_from(new_model)
-        elif isinstance(model, KVStoreNode):
-
-            if len(attr_updates) > 0:
-                updates = attr_updates
+                    item.delete(*args, **kwargs)
+                except BaseTreeNode.DoesNotExist:
+                    pass
+        # At this point all descendants were deleted.
+        # Self delete :)
+        try:
+            if self.is_folder:
+                deleted_item_ids.append(str(self.pk))
             else:
-                updates = [{
-                    'kv_inherited': True,
-                    'key': _model.key,
-                    'kv_format': _model.format,
-                    'kv_type': _model.type,
-                    'id': _model.id
-                } for _model in diff]
-
-            self.kv.apply_updates(updates)
-        elif isinstance(model, KVStoreCompNode):
+                last_ver = self.document.versions.last()
+                for page in last_ver.pages.all():
+                    deleted_item_ids.append(str(page.pk))
+            super().delete(*args, **kwargs)
+        except BaseTreeNode.DoesNotExist:
+            # this node was deleted by earlier recursive call
+            # it is ok, just skip
             pass
-        else:
-            raise ValueError(
-                f"Don't know how to replace {model} (found in {diff})"
-            )
 
-    def apply_diff(self, diff, attr_updates):
-        if diff.is_add():
-            self._apply_diff_add(diff)
-        elif diff.is_update():
-            self._apply_diff_update(diff, attr_updates)
-        elif diff.is_delete():
-            self._apply_diff_delete(diff)
-        else:
-            raise ValueError("Unexpected diff {diff} type")
+        self.publish_post_delete_task(deleted_item_ids)
 
-    def replace_access(self, diff):
-        # delete exiting
-        self.access_set.all().delete()
+    @if_redis_present
+    def publish_post_delete_task(self, node_ids: List[str]):
+        current_app.send_task(
+            INDEX_REMOVE_NODE, kwargs={"item_ids": node_ids}, route_name="i3"
+        )
 
-        # replace with new ones
-        for access in diff:
-            Access.create(
-                node=self,
-                access_inherited=True,
-                access=access
-            )
-
-    def replace_kv(self, diff):
-        pass
-
-    def replace_kvcomp(self, diff):
-        pass
-
-    def replace_diff(self, diff):
-        model = diff.first()
-
-        if isinstance(model, Access):
-            self.replace_access(diff)
-        elif isinstance(model, KVStoreNode):
-            # replace associated kv of current node
-            # with new one specified by diff elements
-            self.replace_kv(diff)
-        elif isinstance(model, KVStoreCompNode):
-            # replace associated kvcomp of current node
-            # with new one specified by diff elements
-            self.replace_kvcomp(diff)
-        else:
-            raise ValueError(
-                f"Don't know how to replace {model} (found in {diff})"
-            )
-
-    def apply_diffs(self, diffs_list, attr_updates):
-        for diff in diffs_list:
-            if diff.is_update() or diff.is_add() or diff.is_delete():
-                # add (new), update (existing) or delete(existing)
-                self.apply_diff(diff, attr_updates)
-            elif diff.is_replace():
-                self.replace_diff(diff)
-
-    def update_kv(self, key, operation):
-        pass
-
-    def propagate_changes(
-        self,
-        diffs_set,
-        apply_to_self,
-        attr_updates=[]
-    ):
-        """
-        Recursively propagates list of diffs
-        (i.e. apply changes to all children).
-        diffs_set is a set of papermerge.core.models.Diff instances
-        """
-
-        if apply_to_self:
-            self.apply_diffs(
-                diffs_set,
-                attr_updates=attr_updates
-            )
-
-        children = self.get_children()
-        if children.count() > 0:
-            for node in children:
-                node.apply_diffs(
-                    diffs_set,
-                    attr_updates=attr_updates
-                )
-                node.propagate_changes(
-                    diffs_set,
-                    apply_to_self=False,
-                    attr_updates=attr_updates
-                )
-
-    class Meta(PolymorphicMPTTModel.Meta):
+    class Meta:
         # please do not confuse this "Documents" verbose name
         # with real Document object, which is derived from BaseNodeTree.
         # The reason for this naming confusing is that from the point
         # of view of users, the BaseNodeTree are just a list of documents.
-        verbose_name = _("Documents")
-        verbose_name_plural = _("Documents")
-        _icon_name = 'basetreenode'
+        verbose_name = "Documents"
+        verbose_name_plural = "Documents"
+        _icon_name = "basetreenode"
 
+        constraints = [
+            models.UniqueConstraint(
+                name="unique title per parent per user",
+                fields=("parent", "title", "user_id"),
+            ),
+            # Prohibit `title` duplicates when `parent_id` is NULL
+            models.UniqueConstraint(
+                name="title_uniq_when_parent_is_null_per_user",
+                fields=("title", "user_id"),
+                condition=Q(parent__isnull=True),
+            ),
+        ]
 
-class AbstractNode(models.Model):
-    """
-    Common class apps need to inherit from in order
-    to extend BaseTreeNode model.
-    """
-    base_ptr = models.ForeignKey(
-        BaseTreeNode,
-        related_name=RELATED_NAME_FMT,
-        related_query_name=RELATED_QUERY_NAME_FMT,
-        on_delete=models.CASCADE
-    )
+    def __repr__(self):
+        class_name = type(self).__name__
+        return "{}({!r}, {!r})".format(class_name, self.pk, self.title)
 
-    class Meta:
-        abstract = True
-
-    def get_title(self):
-        return self.base_ptr.title
+    def __str__(self):
+        class_name = type(self).__name__
+        return "{}(pk={}, title='{}', ctype='{}')".format(
+            class_name, self.pk, self.title, self.ctype
+        )

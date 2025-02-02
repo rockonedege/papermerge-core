@@ -1,0 +1,22 @@
+.pages {
+  display: block;
+  position: relative;
+  padding-right: 1rem;
+  overflow-y: auto;
+  overflow-x: auto;
+  background-color: #666;
+  color: white;
+  width: 100%;
+  img {
+    padding: 1rem 1rem 0rem 1rem;
+    width: 600px;
+  }
+}
+
+.loader {
+  overflow-y: auto;
+  overflow-x: auto;
+  background-color: #666;
+  color: white;
+  width: 100%;
+}
